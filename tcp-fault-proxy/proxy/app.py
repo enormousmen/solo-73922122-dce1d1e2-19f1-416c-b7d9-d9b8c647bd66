@@ -18,10 +18,20 @@ Guarantees implemented in this file:
 * A read chunk that crosses the N-byte threshold is split, so forwarding
   stops *exactly* at N bytes.  The unsent tail (backlog) and any FIN stay on
   the proxy side while the direction is paused.
+* Pause takes effect even for a read that was already in flight when the
+  pause was requested: after read() returns, paused state is re-checked
+  *before* any write.  The bytes that were read are held (pending) and no
+  further read is issued until resume, so a manual pause cannot leak the
+  next chunk to the peer or advance the forwarded counter.
+* Resume flushes the held bytes in their original order.  If a preset
+  threshold has not fired yet, the flush is still split at exactly N bytes
+  and re-pauses with the remainder held; a manual pause before N therefore
+  does not lose the preset stop point.
 * Backpressure: while paused no further bytes are read from the socket; the
   kernel receive buffer fills and TCP flow control throttles the sender.
   Nothing is spooled to disk and no whole packets are buffered.  User-space
-  buffering per direction is bounded by the stream read limit (<=256 KiB).
+  buffering per direction is bounded by the stream read limit (<=256 KiB),
+  plus at most the one chunk (<=64 KiB) read before the pause was observed.
 * A FIN (half-close) is held back until the backlog of its own direction has
   been forwarded after resume; the reverse direction keeps flowing.
 * A force-close aborts both transports, cancels both pump tasks and waits
@@ -161,7 +171,9 @@ class Conn:
 
     def pause(self, direction: Direction) -> None:
         st = self.dir[direction]
-        if st.paused or st.finished or st.closed:
+        # A direction whose FIN has not been delivered yet can still be
+        # paused (the FIN and any in-flight bytes must then be held).
+        if st.paused or st.finished:
             return
         st.paused = True
         st.paused_since = _now()
@@ -171,8 +183,10 @@ class Conn:
         st = self.dir[direction]
         if not st.paused:
             return False
-        # Once resumed, the one-shot auto threshold must not fire again.
-        st.pause_after = None
+        # Keep pause_after: a manual pause taken before the preset threshold
+        # was reached must not discard that threshold.  The one-shot property
+        # is enforced by auto_triggered, so a threshold that already fired
+        # will not pause the direction a second time.
         st.paused = False
         st.paused_since = None
         st.resume_event.set()
@@ -230,6 +244,53 @@ async def _wait_resume(st: DirState, conn: Conn) -> None:
             continue
 
 
+def _trip_pause(st: DirState) -> None:
+    st.paused = True
+    st.paused_since = _now()
+    st.resume_event.clear()
+
+
+async def _flush_pending(conn: Conn, st: DirState, writer: asyncio.StreamWriter) -> bool:
+    """Write held bytes back to the peer, in their original order.
+
+    Bytes are only written while the direction is not paused.  If the preset
+    threshold has not fired yet, the held data is split so that forwarding
+    still stops at exactly N cumulative bytes; the remainder is re-held and
+    the direction pauses again.  Returns False when the direction is paused
+    (or the connection died) with data still held, so the caller must not
+    read from the socket.
+    """
+    while st.pending:
+        if conn.closed or st.paused:
+            return False
+        data = st.pending
+        threshold = st.pause_after
+        if (
+            not st.auto_triggered
+            and threshold is not None
+            and st.forwarded + len(data) >= threshold
+        ):
+            cut = max(0, threshold - st.forwarded)
+            head, tail = data[:cut], data[cut:]
+            if head:
+                writer.write(head)
+                # Count synchronously with the write: the event loop cannot
+                # interleave a pause request between these two statements, so
+                # an observer that saw paused=true never sees this counter
+                # move afterwards.
+                st.forwarded += len(head)
+                await writer.drain()
+            st.pending = tail
+            st.auto_triggered = True
+            _trip_pause(st)
+            return False
+        st.pending = b""
+        writer.write(data)
+        st.forwarded += len(data)
+        await writer.drain()
+    return True
+
+
 async def pump(conn: Conn, direction: Direction) -> None:
     """Forward exactly one direction, honouring the pause/backlog rules."""
     if direction == "c2r":
@@ -243,28 +304,32 @@ async def pump(conn: Conn, direction: Direction) -> None:
             # While paused we do NOT touch the socket at all: no reads (which
             # would buffer more user-space data) and no FIN delivery.  The
             # kernel receive buffer fills and TCP backpressure reaches the
-            # sender; the held backlog is at most one split read tail.
+            # sender; the held backlog is at most one in-flight read chunk
+            # plus one split tail.
             if st.paused:
                 await _wait_resume(st, conn)
                 if conn.closed:
                     return
 
-            # Flush the backlog that was held when the threshold tripped,
-            # before reading anything new from the socket.
+            # Flush the backlog that was held when the threshold tripped or
+            # when a pause interrupted an in-flight read, before reading
+            # anything new from the socket.  This may re-pause at N.
             if st.pending:
-                data = st.pending
-                st.pending = b""
-                writer.write(data)
-                # drain() raises ConnectionReset/aborted when force-close
-                # aborts the transport, which cancels this task cleanly.
-                await writer.drain()
-                st.forwarded += len(data)
-                if st.fin_pending:
-                    _deliver_fin(writer, st)
+                if not await _flush_pending(conn, st, writer):
+                    if conn.closed:
+                        return
+                    continue  # paused again with the remainder held
+                if conn.closed:
                     return
 
+            # A pause confirmed while flushing must also stop FIN delivery;
+            # go back to the top and wait, then flush and close afterwards.
+            if st.paused:
+                continue
+
+            # FIN is delivered only after the direction's backlog is fully
+            # sent and the direction is not paused.
             if st.eof_seen:
-                # EOF arrived while paused; backlog (if any) is now flushed.
                 if st.fin_pending:
                     _deliver_fin(writer, st)
                 return
@@ -273,19 +338,17 @@ async def pump(conn: Conn, direction: Direction) -> None:
             if data == b"":
                 st.eof_seen = True
                 st.closed = True
-                if st.paused:
-                    # FIN must not cross the pause; wait, then flush backlog.
-                    await _wait_resume(st, conn)
-                    if conn.closed:
-                        return
-                    if st.pending:
-                        tail = st.pending
-                        st.pending = b""
-                        writer.write(tail)
-                        await writer.drain()
-                        st.forwarded += len(tail)
-                _deliver_fin(writer, st)
-                return
+                st.fin_pending = True
+                # Never deliver the FIN past a pause; the top of the loop
+                # waits for resume and flushes pending first.
+                continue
+
+            # The pause may have been confirmed while this read was already
+            # in flight.  Hold the chunk exactly as read: do not write it and
+            # do not advance the forwarded counter until resume.
+            if st.paused:
+                st.pending += data
+                continue
 
             # Threshold handling: split the chunk so we stop exactly at N,
             # even across read-block boundaries.
@@ -295,23 +358,22 @@ async def pump(conn: Conn, direction: Direction) -> None:
                 and threshold is not None
                 and st.forwarded + len(data) >= threshold
             ):
-                cut = threshold - st.forwarded
+                cut = max(0, threshold - st.forwarded)
                 head, tail = data[:cut], data[cut:]
-                writer.write(head)
-                await writer.drain()
-                st.forwarded += len(head)
+                if head:
+                    writer.write(head)
+                    st.forwarded += len(head)
+                    await writer.drain()
                 st.auto_triggered = True
                 if tail:
                     # Held backlog: small, never spooled to disk.
                     st.pending = tail
-                st.paused = True
-                st.paused_since = _now()
-                st.resume_event.clear()
+                _trip_pause(st)
                 continue
 
             writer.write(data)
-            await writer.drain()
             st.forwarded += len(data)
+            await writer.drain()
     except (asyncio.CancelledError, ConnectionError, RuntimeError):
         # Force-close (transport abort / task cancel) or peer reset: the
         # supervisor performs the cleanup.

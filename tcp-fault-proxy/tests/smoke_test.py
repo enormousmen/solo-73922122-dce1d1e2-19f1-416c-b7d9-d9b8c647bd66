@@ -18,7 +18,19 @@ Scenarios:
   6. force-close interrupts paused direction and blocked write, tasks exit,
      control API and other connections stay usable;
   7. backpressure: while paused the sender cannot drain the whole sample and
-     proxy per-direction user-space backlog stays <= 256 KiB.
+     proxy per-direction user-space backlog stays <= 256 KiB;
+  8. manual pause confirmed while a read is already in flight (no data yet):
+     the first chunk that arrives afterwards is held, never forwarded, the
+     forwarded counter stays frozen, and resume delivers it in order with the
+     FIN half-close;
+  9. manual pause early in a direction that also has preset N: resume flushes
+     the held bytes in order and still stops exactly at N, re-pausing with
+     only the tail held; a second resume completes with an intact hash;
+ 10. reverse (receipt) direction: pausing r2c before the receipt exists stops
+     it at the proxy; sender stays in waiting-receipt until resume;
+ 11. pause requested mid-stream while a read is in flight: the counter
+     freezes, held bytes stay within one read chunk, resume delivers the
+     whole payload in order and the receiver hash matches.
 """
 
 from __future__ import annotations
@@ -29,6 +41,7 @@ import json
 import os
 import socket
 import sys
+import threading
 import time
 
 PROXY_API = os.getenv("PROXY_API", "127.0.0.1:8080")
@@ -77,7 +90,20 @@ def start_send(size: int) -> dict:
 def newest_conn() -> dict | None:
     data = http_json(PROXY_API, "GET", "/connections")
     active = [c for c in data["connections"] if not c["closed"]]
-    return active[0] if active else None
+    # /connections lists active connections oldest-first; the connection just
+    # opened by the test is the most recently added one.
+    return active[-1] if active else None
+
+
+def close_stale_connections() -> None:
+    """Force-close connections left over from an earlier run/debug session."""
+    data = http_json(PROXY_API, "GET", "/connections")
+    for c in data["connections"]:
+        if not c["closed"]:
+            try:
+                http_json(PROXY_API, "POST", f"/connections/{c['id']}/force-close", {})
+            except Exception:
+                pass
 
 
 def wait_conn_active(timeout: float = 5.0) -> dict:
@@ -136,6 +162,43 @@ def raw_upload(size: int, pause_after: int | None):
     return sock, digest.hexdigest()
 
 
+def raw_connect() -> socket.socket:
+    sock = socket.create_connection(PROXY_TCP.split(":"))
+    sock.settimeout(10)
+    return sock
+
+
+def send_pattern(sock: socket.socket, digest, size: int) -> None:
+    """Send deterministic bytes without shutting the write side down."""
+    block = bytes((i * 31 + 7) & 0xFF for i in range(4096))
+    remaining = size
+    while remaining > 0:
+        chunk = block[: min(len(block), remaining)]
+        sock.sendall(chunk)
+        digest.update(chunk)
+        remaining -= len(chunk)
+
+
+def get_conn_any(cid: str) -> dict | None:
+    """Look up a connection in the active list or in the retired records."""
+    data = http_json(PROXY_API, "GET", "/connections")
+    for c in data["connections"]:
+        if c["id"] == cid:
+            return c
+    return None
+
+
+def wait_dir(cid: str, direction: str, predicate, timeout: float = 10.0) -> dict:
+    deadline = time.time() + timeout
+    st = {}
+    while time.time() < deadline:
+        st = http_json(PROXY_API, "GET", f"/connections/{cid}")["directions"][direction]
+        if predicate(st):
+            return st
+        time.sleep(0.02)
+    return st
+
+
 def recv_all(sock: socket.socket) -> bytes:
     chunks = []
     while True:
@@ -160,6 +223,7 @@ def main() -> int:
     check("user-space cap is 256 KiB", h["stream_limit_bytes"] == 256 * 1024)
     http_json(SENDER_API, "GET", "/health")
     http_json(RECEIVER_API, "GET", "/health")
+    close_stale_connections()
 
     # 1. Baseline ---------------------------------------------------------- #
     clear_preset()
@@ -224,6 +288,13 @@ def main() -> int:
     check("resume -> phase done", run["phase"] == "done", run.get("error") or "")
     check("resume -> byte match", run["byte_match"] is True)
     check("resume -> sha256 match (no loss/dup/reorder)", run["hash_match"] is True)
+    # The preset threshold stays recorded (so a later manual pause/resume
+    # cannot fire it again) but is one-shot: auto_triggered is already true.
+    # The connection may already be retired by the time the receipt is read.
+    st_final = (get_conn_any(cid) or {}).get("directions", {}).get("c2r", {})
+    check("preset threshold kept but one-shot after auto pause",
+          st_final.get("pause_after") == n and st_final.get("auto_triggered") is True,
+          f"pause_after={st_final.get('pause_after')} auto={st_final.get('auto_triggered')}")
     check("receipt appears only after resume",
           wait_receiver_count(before + 1) == before + 1)
     clear_preset()
@@ -352,6 +423,164 @@ def main() -> int:
     run = wait_sender(run["run_id"])
     check("backpressure test finishes clean", run["hash_match"] is True)
     clear_preset()
+
+    # 8. Manual pause while a read is already in flight -------------------- #
+    # Deterministic interleaving without racing the pump: pause before the
+    # client sends anything.  The pump is then blocked in read(); the first
+    # bytes that arrive afterwards are necessarily read *after* the pause was
+    # confirmed and must be held, not forwarded.
+    set_preset(c2r=400_000)
+    sock = raw_connect()
+    digest = hashlib.sha256()
+    conn = wait_conn_active()
+    cid = conn["id"]
+    http_json(PROXY_API, "POST", f"/connections/{cid}/pause", {"direction": "c2r"})
+    st = wait_dir(cid, "c2r", lambda s: s["paused"])
+    check("manual pause engaged with pump blocked in read()",
+          st["paused"] is True and st["forwarded_bytes"] == 0)
+    send_pattern(sock, digest, 300_000)  # < preset N while paused
+    time.sleep(0.5)
+    st = http_json(PROXY_API, "GET", f"/connections/{cid}")["directions"]["c2r"]
+    check("bytes read after pause are held, not forwarded",
+          st["forwarded_bytes"] == 0 and st["pending_bytes"] > 0,
+          f"forwarded={st['forwarded_bytes']} pending={st['pending_bytes']}")
+    # Resume: held bytes go out in order; because the preset threshold
+    # (400000) was not consumed, forwarding must still stop exactly at N.
+    http_json(PROXY_API, "POST", f"/connections/{cid}/resume", {"direction": "c2r"})
+    send_pattern(sock, digest, 300_000)
+    st = wait_dir(cid, "c2r", lambda s: s["paused"] and s["forwarded_bytes"] > 0)
+    check("resume flush still stops exactly at preset N",
+          st["paused"] is True and st["forwarded_bytes"] == 400_000,
+          f"forwarded={st['forwarded_bytes']} N=400000")
+    # At most one read chunk plus one split tail may remain in user space;
+    # the rest of the payload waits in the kernel under backpressure.
+    time.sleep(0.3)
+    st2 = http_json(PROXY_API, "GET", f"/connections/{cid}")["directions"]["c2r"]
+    check("counter stays at N and held data is bounded",
+          st2["forwarded_bytes"] == 400_000
+          and st2["pending_bytes"] <= 64 * 1024,
+          f"forwarded={st2['forwarded_bytes']} pending={st2['pending_bytes']}")
+    sock.shutdown(socket.SHUT_WR)
+    http_json(PROXY_API, "POST", f"/connections/{cid}/resume", {"direction": "c2r"})
+    reply = recv_all(sock)
+    sock.close()
+    receipt = json.loads(reply.decode().strip().splitlines()[-1])
+    check("in-flight pause/resume -> byte count intact",
+          receipt["bytes"] == 600_000, f"got={receipt['bytes']}")
+    check("in-flight pause/resume -> sha256 intact",
+          receipt["sha256"] == digest.hexdigest())
+    clear_preset()
+
+    # 9. Manual pause mid-stream with FIN already sent by the client -------- #
+    # Pause first, then send the payload and the FIN.  The pump holds the
+    # in-flight read; FIN is only delivered after the held bytes are flushed
+    # on resume, and the receiver only then produces its receipt.
+    set_preset()
+    sock = raw_connect()
+    digest = hashlib.sha256()
+    conn = wait_conn_active()
+    cid = conn["id"]
+    http_json(PROXY_API, "POST", f"/connections/{cid}/pause", {"direction": "c2r"})
+    wait_dir(cid, "c2r", lambda s: s["paused"])
+    send_pattern(sock, digest, 256 * 1024)
+    sock.shutdown(socket.SHUT_WR)  # FIN follows the data
+    time.sleep(0.6)
+    st = http_json(PROXY_API, "GET", f"/connections/{cid}")["directions"]["c2r"]
+    check("manual pause holds upload+FIN",
+          st["forwarded_bytes"] == 0 and st["pending_bytes"] > 0,
+          f"forwarded={st['forwarded_bytes']} pending={st['pending_bytes']}")
+    check("FIN withheld while paused", st["half_closed_delivered"] is False)
+    http_json(PROXY_API, "POST", f"/connections/{cid}/resume", {"direction": "c2r"})
+    reply = recv_all(sock)
+    sock.close()
+    receipt = json.loads(reply.decode().strip().splitlines()[-1])
+    check("pause+FIN resume -> bytes/hash intact",
+          receipt["bytes"] == 256 * 1024 and receipt["sha256"] == digest.hexdigest())
+
+    # 10. Reverse direction: receipt held across an in-flight read ---------- #
+    set_preset()
+    run = start_send(size)
+    conn = wait_conn_active()
+    cid = conn["id"]
+    # Pause r2c while the upload is still running; the receipt arrives later
+    # and must be held by the proxy, not forwarded to the sender.
+    http_json(PROXY_API, "POST", f"/connections/{cid}/pause", {"direction": "r2c"})
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        conn = http_json(PROXY_API, "GET", f"/connections/{cid}")
+        if conn["directions"]["c2r"]["half_closed_delivered"]:
+            break
+        time.sleep(0.05)
+    time.sleep(0.5)
+    st = http_json(PROXY_API, "GET", f"/connections/{cid}")["directions"]["r2c"]
+    check("r2c pause engaged before receipt", st["paused"] is True)
+    check("receipt bytes held while r2c paused", st["forwarded_bytes"] == 0)
+    run_mid = http_json(SENDER_API, "GET", f"/sends/{run['run_id']}")
+    check("sender still waiting while receipt held",
+          run_mid["phase"] == "waiting-receipt")
+    http_json(PROXY_API, "POST", f"/connections/{cid}/resume", {"direction": "r2c"})
+    run = wait_sender(run["run_id"])
+    check("held receipt delivered intact after resume",
+          run["phase"] == "done" and run["hash_match"] is True)
+    clear_preset()
+
+    # 11. Pause requested mid-stream while the pump is reading ------------- #
+    # A background thread streams data continuously; the pause is issued
+    # while a read() is in flight.  Whatever the pump reads after the pause
+    # is confirmed must be held (bounded by one read chunk), and no further
+    # read may advance the counter until resume.
+    set_preset()
+    sock = raw_connect()
+    digest = hashlib.sha256()
+    payload = big_size
+    sent_lock = threading.Lock()
+    sent_total = [0]
+
+    def feeder() -> None:
+        block = bytes((i * 31 + 7) & 0xFF for i in range(4096))
+        try:
+            while sent_total[0] < payload:
+                sock.sendall(block)
+                with sent_lock:
+                    digest.update(block)
+                    sent_total[0] += len(block)
+        except OSError:
+            pass
+
+    conn = wait_conn_active()
+    cid = conn["id"]
+    t = threading.Thread(target=feeder, daemon=True)
+    t.start()
+    # Wait until data is actually flowing, then pause mid-stream.
+    wait_dir(cid, "c2r", lambda s: s["forwarded_bytes"] > 128 * 1024)
+    http_json(PROXY_API, "POST", f"/connections/{cid}/pause", {"direction": "c2r"})
+    st = wait_dir(cid, "c2r", lambda s: s["paused"])
+    time.sleep(0.6)
+    st = http_json(PROXY_API, "GET", f"/connections/{cid}")["directions"]["c2r"]
+    frozen = st["forwarded_bytes"]
+    check("mid-stream pause freezes forwarded counter",
+          st["paused"] is True and 0 < frozen < payload, f"forwarded={frozen}")
+    check("held data bounded by one read chunk + tail",
+          st["pending_bytes"] <= 128 * 1024, f"pending={st['pending_bytes']}")
+    time.sleep(0.4)
+    st = http_json(PROXY_API, "GET", f"/connections/{cid}")["directions"]["c2r"]
+    check("counter stays frozen and held bytes stay bounded",
+          st["forwarded_bytes"] == frozen and st["pending_bytes"] <= 128 * 1024,
+          f"forwarded={st['forwarded_bytes']} pending={st['pending_bytes']}")
+    # Resume first: the feeder may still be blocked in sendall() because the
+    # paused proxy exerts TCP backpressure.  After resume it drains, then the
+    # client half-closes and we verify the receiver's hash.
+    check("feeder still blocked by backpressure while paused",
+          t.is_alive(), f"sent={sent_total[0]}/{payload}")
+    http_json(PROXY_API, "POST", f"/connections/{cid}/resume", {"direction": "c2r"})
+    t.join(timeout=60)
+    sock.shutdown(socket.SHUT_WR)
+    reply = recv_all(sock)
+    sock.close()
+    receipt = json.loads(reply.decode().strip().splitlines()[-1])
+    check("mid-stream pause resume -> no loss/dup/reorder",
+          receipt["bytes"] == payload and receipt["sha256"] == digest.hexdigest(),
+          f"got={receipt['bytes']} expected={payload}")
 
     # Summary -------------------------------------------------------------- #
     failed = [r for r in results if r[0] == FAIL]

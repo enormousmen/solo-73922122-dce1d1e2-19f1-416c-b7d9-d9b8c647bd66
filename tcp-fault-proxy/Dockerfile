@@ -14,4 +14,7 @@ COPY . /app
 ENV SERVICE=proxy
 EXPOSE 8080 9000 9100 9101
 
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=20 \
+  CMD python -c "import os,socket; p={'proxy':8080,'sender':8080}.get(os.environ.get('SERVICE','proxy'),9100); socket.create_connection(('127.0.0.1',p),2).close()"
+
 CMD ["sh", "-c", "if [ \"$SERVICE\" = proxy ]; then uvicorn proxy.app:app --host 0.0.0.0 --port 8080; elif [ \"$SERVICE\" = sender ]; then uvicorn sender.app:app --host 0.0.0.0 --port 8080; else python -m receiver.app; fi"]

@@ -10,12 +10,22 @@ services:
     ports:
       - "127.0.0.1:9100:9100"
       - "127.0.0.1:9101:9101"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 9100), 1).close()"
+      interval: 2s
+      timeout: 2s
+      retries: 30
 
   proxy:
-    image: tcp-fault-proxy:latest
     build: .
+    image: tcp-fault-proxy:latest
     depends_on:
-      - receiver
+      receiver:
+        condition: service_healthy
     environment:
       SERVICE: proxy
       PROXY_HOST: 0.0.0.0
@@ -26,13 +36,24 @@ services:
       # 9000: 故障转发 TCP 入口；8080: 控制 API / docs
       - "127.0.0.1:9000:9000"
       - "127.0.0.1:8080:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 8080), 1).close()"
+      interval: 2s
+      timeout: 2s
+      retries: 30
 
   sender:
-    image: tcp-fault-proxy:latest
     build: .
+    image: tcp-fault-proxy:latest
     depends_on:
-      - proxy
-      - receiver
+      proxy:
+        condition: service_healthy
+      receiver:
+        condition: service_healthy
     environment:
       SERVICE: sender
       SENDER_TARGET_HOST: proxy
