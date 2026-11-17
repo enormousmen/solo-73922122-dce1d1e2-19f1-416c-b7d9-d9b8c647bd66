@@ -1,0 +1,42 @@
+services:
+  receiver:
+    build: .
+    image: tcp-fault-proxy:latest
+    environment:
+      SERVICE: receiver
+      RECEIVER_HOST: 0.0.0.0
+      RECEIVER_TCP_PORT: "9100"
+      RECEIVER_HTTP_PORT: "9101"
+    ports:
+      - "127.0.0.1:9100:9100"
+      - "127.0.0.1:9101:9101"
+
+  proxy:
+    image: tcp-fault-proxy:latest
+    build: .
+    depends_on:
+      - receiver
+    environment:
+      SERVICE: proxy
+      PROXY_HOST: 0.0.0.0
+      PROXY_PORT: "9000"
+      TARGET_HOST: receiver
+      TARGET_PORT: "9100"
+    ports:
+      # 9000: 故障转发 TCP 入口；8080: 控制 API / docs
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:8080:8080"
+
+  sender:
+    image: tcp-fault-proxy:latest
+    build: .
+    depends_on:
+      - proxy
+      - receiver
+    environment:
+      SERVICE: sender
+      SENDER_TARGET_HOST: proxy
+      SENDER_TARGET_PORT: "9000"
+    ports:
+      # 发送器自己的控制 API / docs
+      - "127.0.0.1:8081:8080"
